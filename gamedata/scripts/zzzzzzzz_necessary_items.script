@@ -1,0 +1,409 @@
+-- Necessary Items
+-- Section-level inventory protection for bulk and automatic outgoing actions.
+-- A necessary mark never participates in inventory sorting.
+
+local BUILD = "d2026.11.9.2"
+local SAVE_KEY = "gamma_necessary_item_sections"
+
+-- The item-state tab, in RAX layer units: 15x5 px at 1920x1080.
+local TAB_WIDTH = 10.67
+local TAB_HEIGHT = 3.56
+local TAB_NUDGE = 1.42
+-- Where a tab clears its neighbours, in UI units: just past the right edge of
+-- the stack counter (16, utils_16.xml's <cnt>) and just below an artefact's
+-- condition readout (about 12.4).
+local TAB_PAST_COUNTER_X = 16.55
+local TAB_BELOW_READOUT_Y = 13.5
+-- The lists SortingPlus marks. Equipment, belt and quick slots do not refresh
+-- when a mark changes, and the weapon slots draw layers rotated.
+local TAB_BAGS = {
+	actor_bag = true,
+	actor_trade_bag = true,
+	npc_bag = true,
+	npc_trade_bag = true,
+}
+local TAB_TEXTURE = {
+	favorite = "ui\\necessary_items\\tab_favorite",
+	junk = "ui\\necessary_items\\tab_junk",
+	necessary = "ui\\necessary_items\\tab_necessary",
+	favorite_necessary = "ui\\necessary_items\\tab_favorite_necessary",
+	junk_necessary = "ui\\necessary_items\\tab_junk_necessary",
+}
+
+local necessary_sections = {}
+local bulk_move_depth = 0
+local initialized = false
+
+-- Mark state ------------------------------------------------------------------
+
+local function section_of(item_or_section)
+	local value_type = type(item_or_section)
+	if value_type == "string" then
+		return item_or_section
+	end
+
+	if value_type == "number" then
+		item_or_section = level.object_by_id(item_or_section)
+	end
+
+	if item_or_section and item_or_section.section then
+		return item_or_section:section()
+	end
+end
+
+function is_necessary(item_or_section)
+	local section = section_of(item_or_section)
+	return section and necessary_sections[section] == true or false
+end
+
+function set_necessary(item_or_section, state)
+	local section = section_of(item_or_section)
+	if section then
+		necessary_sections[section] = state and true or nil
+	end
+end
+
+local function save_state(mdata)
+	mdata[SAVE_KEY] = necessary_sections
+end
+
+local function load_state(mdata)
+	local loaded = mdata and mdata[SAVE_KEY]
+	local sanitized = {}
+
+	if type(loaded) == "table" then
+		for section, state in pairs(loaded) do
+			-- A non-string key is unreachable through is_necessary and can
+			-- never be unmarked, so drop it instead of round-tripping it
+			-- into every later save.
+			if type(section) == "string" and state then
+				sanitized[section] = true
+			end
+		end
+	end
+
+	-- Loading a save without this mod's data must not retain another save's
+	-- marks. Swap only once the payload has been walked, so a bad payload
+	-- cannot leave the live marks half-cleared.
+	necessary_sections = sanitized
+end
+
+-- Context menu ----------------------------------------------------------------
+
+local function menu_precondition(_obj, _bag, mode)
+	return mode ~= "repair"
+end
+
+local function menu_name(obj)
+	return is_necessary(obj) and "st_necessary_items_unmark" or "st_necessary_items_mark"
+end
+
+local function menu_action(obj)
+	set_necessary(obj, not is_necessary(obj))
+	-- No argument requests only UpdateItems; mode 1 would also re-sort.
+	if rax_icon_layers and rax_icon_layers.refresh then
+		rax_icon_layers.refresh()
+	end
+end
+
+local function queue_menu_functor()
+	if rax_dynamic_custom_functor and rax_dynamic_custom_functor.add_functor then
+		-- SortingPlus queues Favorite and Junk before this late callback. Using
+		-- the same property system keeps the three entries adjacent.
+		rax_dynamic_custom_functor.add_functor(
+			"necessary_items_toggle",
+			menu_name,
+			menu_precondition,
+			menu_action
+		)
+	end
+end
+
+-- Item-state tab --------------------------------------------------------------
+
+local function sorting_mark(section)
+	local sorting = zzz_rax_sortingplus_mcm
+	if not sorting then
+		return
+	end
+
+	if sorting.is_favorite and sorting.is_favorite(section) then
+		return "favorite"
+	end
+	if sorting.is_junk and sorting.is_junk(section) then
+		return "junk"
+	end
+end
+
+local function tab_state(section)
+	local mark = sorting_mark(section)
+	if is_necessary(section) then
+		return mark and (mark .. "_necessary") or "necessary"
+	end
+	return mark
+end
+
+-- The same test utils_ui's Add_Counter makes. Layers run before it, so the
+-- counter window cannot be asked yet.
+local function shows_stack_counter(cell, section)
+	if cell.showcase ~= 0 then
+		return false
+	end
+	return (IsItem("ammo", section) and not IsItem("grenade_ammo", section)) or cell:HasChild()
+end
+
+-- Item UI Improvements can draw an artefact's condition at the cell's top right.
+local function condition_at_top_right(section)
+	local info = z_item_icon_info
+	local settings = info and info.settings and info.settings.cond_text
+	return settings and settings.enable and settings.alt_artefact_pos == 2
+		and info.arty_table and info.arty_table[SYS_GetParam(0, section, "kind", "na")]
+end
+
+-- RAX multiplies a layer's x by grid_size / 50 and the screen ratio, its y by
+-- grid_size / 50 alone and its width by the ratio alone. It centres the layer
+-- on x + w / 2, so x and y are the displayed top-left corner.
+local function tab_position(cell, section, item_width)
+	local scale = cell.grid_size / 50
+
+	-- The condition readout takes an artefact's top right, and the stack counter
+	-- or the tier chevrons on the icon its top left, so the tab sits flush right
+	-- just below the readout.
+	if condition_at_top_right(section) then
+		return item_width - TAB_WIDTH / scale, TAB_BELOW_READOUT_Y / scale
+	end
+
+	-- The top edge between the top-left magazine and upgrade marks and the
+	-- top-right quest, frozen and magazine marks is free; the nudge clears the
+	-- ready-magazine mark.
+	local x = item_width / 2 + (TAB_NUDGE - TAB_WIDTH / 2) / scale
+	if shows_stack_counter(cell, section) then
+		x = math.max(x, TAB_PAST_COUNTER_X / (utils_xml.screen_ratio() * scale))
+	end
+	return math.max(0, math.min(x, item_width - TAB_WIDTH / scale)), 0
+end
+
+local function item_state_tab(cell, _obj, section)
+	if not (cell and cell.container and TAB_BAGS[cell.container.ID]) then
+		return
+	end
+
+	local state = tab_state(section)
+	if not state then
+		return
+	end
+
+	local x, y = tab_position(cell, section, utils_xml.get_item_axis(section).w)
+	return {
+		texture = TAB_TEXTURE[state],
+		x = x,
+		y = y,
+		w = TAB_WIDTH,
+		h = TAB_HEIGHT,
+	}
+end
+
+-- Without RAX Dynamic Icon Layers only the item-state tabs are lost.
+local function register_item_tab()
+	if rax_icon_layers and rax_icon_layers.register then
+		rax_icon_layers.register("necessary_items_state_tab", item_state_tab)
+	else
+		printf("[Necessary Items] RAX Dynamic Icon Layers not found: marks work, item tabs disabled")
+	end
+end
+
+-- Bulk-action policy ----------------------------------------------------------
+
+local function disable_favorite_put_all_protection()
+	if zzz_rax_sortingplus_mcm then
+		-- Favorite remains a sorting mark. Necessary is the retention mark.
+		-- SortingPlus reloads this option from MCM, so reapply this policy
+		-- immediately before every Put All action, the only place stock reads it.
+		zzz_rax_sortingplus_mcm.BLOCKPUTALLFAVS = false
+	end
+end
+
+local function is_protected_actor_source(gui, obj, bag)
+	if not (gui and is_necessary(obj)) then
+		return false
+	end
+	if gui.mode == "loot" then
+		return bag == "actor_bag" or bag == "actor_equ"
+			or bag == "actor_belt" or bag == "actor_quick"
+	end
+	return gui.mode == "trade" and bag == "actor_trade_bag"
+end
+
+local function run_bulk_action(action, gui)
+	bulk_move_depth = bulk_move_depth + 1
+	local ok, result = pcall(action, gui)
+	bulk_move_depth = bulk_move_depth - 1
+	if not ok then
+		error(result, 0)
+	end
+	return result
+end
+
+local function actor_menu_before_move(flags, _npc_id, obj, _mode, _bag_id)
+	if bulk_move_depth > 0 and obj and is_necessary(obj) then
+		-- Never restore ret_value: another callback may already have vetoed it.
+		flags.ret_value = false
+	end
+end
+
+-- Integrations ----------------------------------------------------------------
+
+local function guard_inventory_screen()
+	local inventory = ui_inventory.UIInventory
+
+	local put_all_base = inventory.LMode_PutAll
+	function inventory:LMode_PutAll()
+		disable_favorite_put_all_protection()
+		return run_bulk_action(put_all_base, self)
+	end
+
+	-- Automatic routines such as SortingPlus auto-junk may bypass Cond_Move.
+	local action_move_base = inventory.Action_Move
+	function inventory:Action_Move(obj, bag)
+		if bulk_move_depth > 0 and is_protected_actor_source(self, obj, bag) then
+			return
+		end
+		return action_move_base(self, obj, bag)
+	end
+
+	-- A UI stack contains one section, so one representative safely guards all.
+	local move_all_base = inventory.Action_Move_All
+	function inventory:Action_Move_All(obj, bag)
+		if is_protected_actor_source(self, obj, bag) then
+			return
+		end
+		return move_all_base(self, obj, bag)
+	end
+
+	local drop_all_base = inventory.Action_Drop_All
+	function inventory:Action_Drop_All(obj, bag)
+		if bag == "actor_bag" and is_necessary(obj) then
+			return
+		end
+		return drop_all_base(self, obj, bag)
+	end
+
+	-- SortingPlus puts Junk directly into the trade offer when trade opens.
+	-- Guard that automatic pass while retaining manual single-item selling.
+	-- Stock has no SortJunkTrade, so this wrapper must never synthesise one.
+	local sort_junk_base = inventory.SortJunkTrade
+	if sort_junk_base then
+		function inventory:SortJunkTrade()
+			return run_bulk_action(sort_junk_base, self)
+		end
+	end
+end
+
+local function guard_companion_give_all()
+	local get_inventory_table_base = axr_companions.get_inventory_table
+	function axr_companions.get_inventory_table(npc, npc_id, mode)
+		local items = get_inventory_table_base(npc, npc_id, mode)
+		local source_id = npc_id or (npc and npc:id())
+
+		-- Mode 3 is used only by Give All and its carry-weight check.
+		if mode == 3 and source_id == AC_ID then
+			for id, section in pairs(items) do
+				if is_necessary(section) then
+					items[id] = nil
+				end
+			end
+		end
+
+		return items
+	end
+end
+
+local function guard_fast_transfer()
+	local move_items_fast_base = ish_fast_transfer and ish_fast_transfer.Move_Items_Fast
+	if not move_items_fast_base then
+		return
+	end
+
+	function ish_fast_transfer.Move_Items_Fast(bag, idx)
+		local gui = ui_inventory.GUI
+		local container = gui and gui.CC and gui.CC[bag]
+		local obj = container and container:GetObj(idx)
+
+		-- Shift-hover schedules raw Action_Move calls after this function returns,
+		-- so reject a protected actor stack before it enters that queue.
+		if is_protected_actor_source(gui, obj, bag) then
+			return
+		end
+
+		return move_items_fast_base(bag, idx)
+	end
+end
+
+local function guard_unusable_parts()
+	local is_unusable_part_base = unusable_parts_handler and unusable_parts_handler.is_unusable_part
+	if not is_unusable_part_base then
+		return
+	end
+
+	function unusable_parts_handler.is_unusable_part(item)
+		if is_necessary(item) then
+			return false
+		end
+		return is_unusable_part_base(item)
+	end
+end
+
+-- A magazine mod that provides actor_stash_patch (Mags Redux, which GAMMA
+-- ships switched off, or GAMMA Mags Reloaded) evaluates these conditions
+-- when Quick Release drops the actor's backpack as a stash; a true result
+-- keeps the item on the actor. Without one, this does nothing.
+local function guard_quick_release()
+	if actor_stash_patch and actor_stash_patch.add_condition then
+		actor_stash_patch.add_condition(is_necessary)
+	end
+end
+
+-- The copy of Zatura's auto-stack in Jack Harris's Anti Lag (GAMMA's
+-- development branch) merges partly used items with the open stash or body
+-- and deletes the emptied ones. Its multi-use test is where it picks items,
+-- so marked types answer no there. Zatura's own script has stack_item and
+-- stays inside the actor's inventory.
+local function guard_anti_lag_autostack()
+	if not (zatura_autostack and zatura_autostack.autostack_playerinv) or zatura_autostack.stack_item then
+		return
+	end
+
+	function zatura_autostack.IsItem(kind, section, ...)
+		if kind == "multiuse" and is_necessary(section) then
+			return false
+		end
+		return IsItem(kind, section, ...)
+	end
+end
+
+-- Lifecycle -------------------------------------------------------------------
+
+function on_game_start()
+	if initialized then
+		return
+	end
+	initialized = true
+
+	-- Persistence, the bulk-move veto and the menu entry come first, so a
+	-- failure in a later integration can never cost the player their marks.
+	RegisterScriptCallback("ActorMenu_on_item_before_move", actor_menu_before_move)
+	RegisterScriptCallback("save_state", save_state)
+	RegisterScriptCallback("load_state", load_state)
+	RegisterScriptCallback("actor_on_first_update", queue_menu_functor)
+	RegisterScriptCallback("on_option_change", queue_menu_functor)
+
+	guard_inventory_screen()
+	guard_companion_give_all()
+	guard_fast_transfer()
+	guard_unusable_parts()
+	guard_quick_release()
+	guard_anti_lag_autostack()
+	register_item_tab()
+
+	printf("[Necessary Items] installed | build=%s | section marks and bulk guards active", BUILD)
+end

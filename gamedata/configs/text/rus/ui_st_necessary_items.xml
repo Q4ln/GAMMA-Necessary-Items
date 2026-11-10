@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="windows-1251" ?>
+<string_table>
+	<string id="st_necessary_items_mark">
+		<text>&#206;&#242;&#236;&#229;&#242;&#232;&#242;&#252; &#237;&#243;&#230;&#237;&#251;&#236;</text>
+	</string>
+	<string id="st_necessary_items_unmark">
+		<text>&#205;&#229; &#241;&#247;&#232;&#242;&#224;&#242;&#252; &#237;&#243;&#230;&#237;&#251;&#236;</text>
+	</string>
+</string_table>
