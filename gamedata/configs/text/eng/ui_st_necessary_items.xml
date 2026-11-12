@@ -6,4 +6,10 @@
 	<string id="st_necessary_items_unmark">
 		<text>Unmark Necessary</text>
 	</string>
+	<string id="st_necessary_items_mark_item">
+		<text>Mark Item Necessary</text>
+	</string>
+	<string id="st_necessary_items_unmark_item">
+		<text>Unmark Item Necessary</text>
+	</string>
 </string_table>

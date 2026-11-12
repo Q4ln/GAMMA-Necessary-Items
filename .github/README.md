@@ -3,18 +3,29 @@
 An inventory mod for the S.T.A.L.K.E.R. Anomaly modpack G.A.M.M.A. It adds a
 **Mark Necessary** entry to the inventory context menu, next to SortingPlus's
 Favorite and Junk. Every item of a marked type then stays in your inventory
-during bulk and automatic transfers. You can still move, drop or sell a marked
-item one at a time when you mean to part with it.
+during bulk and automatic transfers. A second entry, **Mark Item Necessary**,
+gives the same protection to one particular item, such as your own rifle or
+suit, without marking every other item of its kind. You can still move, drop or
+sell a marked item one at a time when you mean to part with it.
 
-- **Per item type:** marking one medkit marks every medkit of the same kind.
-  Each save keeps its own marks.
+- **Type marks:** marking one medkit marks every medkit of the same kind.
+- **Item marks:** the marked item gets a cell of its own, and identical
+  unmarked items move as usual. The mark follows the item through saves, level
+  changes, stashes, gun rebuilds and parts you fit and remove again. Guns,
+  knives, armour, helmets, devices, artefacts, weapon attachments, keepsakes
+  and similar gear can take one; with a magazine mod, so can magazines, mag
+  pouches, side saddles and backpacks. Consumables, ammunition, and weapon and
+  armour parts take type marks only. Item marks need the Modded Exes' server
+  object callbacks, which GAMMA ships.
+- **Saved per save:** each save keeps its own marked types and items.
 - **Protected actions:** the Move all button of a loot or stash screen, a
   stack's move all and drop all, GAMMA's Fast Transfer, companion Give All,
   SortingPlus's automatic junk selling, the Unusable Parts Handler and, with a
   magazine mod, Quick Release.
 - **Coloured tab:** items show a short tab on their inventory cell: green for
   Favorite, red for Junk, bone for Necessary, blue for Favorite + Necessary and
-  magenta for Junk + Necessary.
+  magenta for Junk + Necessary. A single marked item shows the same tab as a
+  marked type.
 - **Favorite and Junk:** they keep sorting as before, and the mod adds no sort
   category and never re-sorts your inventory. While it is enabled,
   SortingPlus's **Block "Move all" for Favorites** option, on in GAMMA's
@@ -27,9 +38,13 @@ item one at a time when you mean to part with it.
 
 *Tabs on marked item types, row by row: green Favorite, blue Favorite + Necessary, bone Necessary, magenta Junk + Necessary, red Junk. Unmarked items have none.*
 
-![Mark Necessary in the item's context menu, next to SortingPlus's Favorite and Junk.](screenshots/mark_necessary_menu.png)
+![The context menu on two unmarked AK-74s stacked x2, with Mark Necessary and, just below it, Mark Item Necessary. The third AK-74, on the right, is item-marked: it has its own cell and the bone tab.](screenshots/item_mark_menu.png)
 
-*Mark Necessary in the item's context menu, next to SortingPlus's Favorite and Junk.*
+*The context menu on two unmarked AK-74s stacked x2, with Mark Necessary and, just below it, Mark Item Necessary. The third AK-74, on the right, is item-marked: it has its own cell and the bone tab.*
+
+![After the Move all button into an empty stash: the two unmarked AK-74s went into the box (top), and the item-marked one stayed in the bag (bottom).](screenshots/item_mark_move_all.png)
+
+*After the Move all button into an empty stash: the two unmarked AK-74s went into the box (top), and the item-marked one stayed in the bag (bottom). Both parts come from one screenshot.*
 
 ## Download
 

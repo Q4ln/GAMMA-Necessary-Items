@@ -1,9 +1,22 @@
 -- Necessary Items
--- Section-level inventory protection for bulk and automatic outgoing actions.
--- A necessary mark never participates in inventory sorting.
+-- Section and item marks that protect items from bulk and automatic outgoing
+-- actions. A necessary mark never participates in inventory sorting.
 
-local BUILD = "d2026.11.9.2"
+local BUILD = "d2026.11.12.1"
 local SAVE_KEY = "gamma_necessary_item_sections"
+-- Item marks: necessary_ids[id] = section. Parked marks belong to parts held
+-- by a host (a gun, a suit, a stash box, a packed artefact):
+-- parked[host_id][slot] = section.
+local ITEM_SAVE_KEY = "gamma_necessary_item_ids"
+local PARKED_SAVE_KEY = "gamma_necessary_item_parked"
+-- A magazine's item mark is this key in its own Mags Reloaded record.
+local MAG_MARK_KEY = "necessary_items_marked"
+-- Windows, in ms: a call's deferred engine or timer work (a detached part's
+-- spawn, Mags' deferred disassembly); a disassembled gun's parts coming back;
+-- Mags making a retooled magazine's record.
+local DEFERRED_MS = 2000
+local DISASSEMBLY_MS = 10000
+local PENDING_MAG_MS = 10000
 
 -- The item-state tab, in RAX layer units: 15x5 px at 1920x1080.
 local TAB_WIDTH = 10.67
@@ -31,8 +44,70 @@ local TAB_TEXTURE = {
 }
 
 local necessary_sections = {}
-local bulk_move_depth = 0
+local necessary_ids = {}
+local parked = {}
+-- Carry hooks may add a check per slot: check(host_id, section, se_host)
+-- returns false when the host's own record no longer holds that part.
+local parked_checks = {}
+-- Not saved: pending_mags, pending_returns and disassembling.
+-- A retooled magazine's mark until Mags makes the new magazine's record.
+local pending_mags = {}
+-- Weapon parts expected back after their call has ended: {section, deadline}.
+local pending_returns = {}
+-- Guns being disassembled: id = the time by which the gun is released.
+local disassembling = {}
+-- Open guard scopes: Put All and SortJunkTrade are bulk, a Move All a stack.
+local move_depth = {bulk = 0, stack = 0}
 local initialized = false
+
+-- Carry capabilities, each set from its integration's install result. Mark
+-- Item is offered on a kind of item only while its flags are.
+local carry = {
+	server = false,       -- server object register/unregister callbacks
+	weapon_clone = false, -- the alife_clone_weapon wrapper
+	magazines = false,
+	psu = false,
+	pouches = false,
+	saddles = false,
+	backpack_pickup = false, -- item_backpack's take handler
+	backpacks = false,
+	scopes = false,       -- GAMMA scopes and other [addons_table] parts
+	addons = false,       -- engine silencers, grenade launchers and scopes
+	disassembly = false,  -- weapon disassembly returning attached parts
+	containers = false,   -- artefact containers
+}
+
+local function pack(...)
+	return {n = select("#", ...), ...}
+end
+
+local logged = {}
+local function log_once(key, message)
+	if not logged[key] then
+		logged[key] = true
+		printf("[Necessary Items] %s", tostring(message))
+	end
+end
+
+-- Runs f in pcall; a failure is logged once under name.
+local function try(name, f, ...)
+	local ok, result = pcall(f, ...)
+	if not ok then
+		log_once(name, name .. " failed: " .. tostring(result))
+	end
+	return ok, result
+end
+
+-- Runs one integration's installer. A raise is logged and costs only that
+-- integration; false means its target is missing.
+local function install(name, installer)
+	local ok, result = pcall(installer)
+	if not ok then
+		log_once("install:" .. name, name .. " failed: " .. tostring(result))
+		return false
+	end
+	return result ~= false
+end
 
 -- Mark state ------------------------------------------------------------------
 
@@ -51,9 +126,51 @@ local function section_of(item_or_section)
 	end
 end
 
+local function id_of(item)
+	local value_type = type(item)
+	if value_type == "number" then
+		return item
+	end
+	if value_type == "string" or not item then
+		return nil
+	end
+	local id = item.id
+	if type(id) == "number" then
+		return id
+	end
+	return id and item:id()
+end
+
+local function is_type_marked(section)
+	return necessary_sections[section] == true
+end
+
+-- A field of an id's Mags Reloaded record; nil without Mags.
+local function mag_property(id, key)
+	local get = magazine_binder and magazine_binder.get_mag_property
+	if type(get) == "function" then
+		return get(id, key)
+	end
+end
+
+-- Item marks are plain table reads, so guards, the stack split and the tab
+-- can ask on every call. A gun's record holding a loaded marked magazine
+-- (is_weapon) never counts: a host holding a marked part is not Necessary.
+function is_item_marked(id)
+	if type(id) ~= "number" then
+		return false
+	end
+	if necessary_ids[id] ~= nil or pending_mags[id] then
+		return true
+	end
+	return mag_property(id, MAG_MARK_KEY) == true and mag_property(id, "is_weapon") ~= true
+end
+
 function is_necessary(item_or_section)
-	local section = section_of(item_or_section)
-	return section and necessary_sections[section] == true or false
+	if is_item_marked(id_of(item_or_section)) then
+		return true
+	end
+	return is_type_marked(section_of(item_or_section))
 end
 
 function set_necessary(item_or_section, state)
@@ -63,8 +180,147 @@ function set_necessary(item_or_section, state)
 	end
 end
 
+local function is_magazine(section)
+	local check = magazine_binder and magazine_binder.is_magazine
+	if type(check) ~= "function" then
+		return false
+	end
+	local ok, value = pcall(check, section)
+	return ok and value == true
+end
+
+-- Mags creates a magazine's record itself; NI only adds its key to one.
+local function magazine_record_ready(id)
+	return type(mag_property(id, "section")) == "string" and mag_property(id, "is_weapon") ~= true
+end
+
+-- Written through the live set_data, so other mods' wrappers see the change.
+-- A gun's record may lose the key but never gains it.
+local function write_magazine_mark(id, state)
+	local binder = magazine_binder
+	local data = binder and binder.get_data and binder.get_data(id)
+	if data == nil and not state then
+		return true
+	end
+	if type(data) ~= "table" or state and data.is_weapon == true then
+		return false
+	end
+	data[MAG_MARK_KEY] = state and true or nil
+	binder.set_data(id, data)
+	return true
+end
+
+-- A failing Mags call only means no change.
+local function set_magazine_mark(id, state)
+	local ok, done = try("magazine mark", write_magazine_mark, id, state)
+	return ok and done
+end
+
+-- A magazine released along with its owner, such as a body being cleaned up,
+-- skips Mags' own unregister, so its record outlives it. The mark key comes
+-- off, so an object that reuses the id does not read as marked.
+local function clear_stale_magazine_mark(id)
+	if mag_property(id, MAG_MARK_KEY) == true then
+		write_magazine_mark(id, false)
+	end
+end
+
+local function valid_id(id)
+	return type(id) == "number" and id >= 1 and id <= 65534 and id % 1 == 0
+end
+
+local function valid_section(value)
+	return type(value) == "string" and value ~= ""
+end
+
+-- Marks an id a carry hook captured, for example from a transaction.
+local function mark_id(id, section)
+	if valid_id(id) and valid_section(section) then
+		necessary_ids[id] = section
+		return true
+	end
+	return false
+end
+
+-- Parked marks are read only by carry hooks, never by a guard or the tab.
+local function park(host_id, slot, section)
+	if not valid_id(host_id) then
+		return
+	end
+	local slots = parked[host_id]
+	if valid_section(section) then
+		if not slots then
+			slots = {}
+			parked[host_id] = slots
+		end
+		slots[slot] = section
+	elseif slots then
+		slots[slot] = nil
+		if next(slots) == nil then
+			parked[host_id] = nil
+		end
+	end
+end
+
+local function parked_slot(host_id, slot)
+	local slots = parked[host_id]
+	return slots and slots[slot]
+end
+
+-- Marking or unmarking by hand also forgets which of a packed artefact's two
+-- items were marked: a packed item marked by hand gives its mark to the
+-- artefact when it is opened.
+function set_item_mark(obj, state)
+	local id, section = obj:id(), obj:section()
+	if is_magazine(section) then
+		necessary_ids[id] = nil
+		pending_mags[id] = nil
+		return set_magazine_mark(id, state)
+	end
+	necessary_ids[id] = state and section or nil
+	park(id, "arty", nil)
+	park(id, "box", nil)
+	return true
+end
+
 local function save_state(mdata)
 	mdata[SAVE_KEY] = necessary_sections
+	mdata[ITEM_SAVE_KEY] = necessary_ids
+	mdata[PARKED_SAVE_KEY] = parked
+end
+
+local function load_item_ids(loaded)
+	local ids = {}
+	if type(loaded) == "table" then
+		for id, section in pairs(loaded) do
+			if valid_id(id) and valid_section(section) then
+				ids[id] = section
+			end
+		end
+	end
+	return ids
+end
+
+local function load_parked(loaded)
+	local hosts = {}
+	if type(loaded) ~= "table" then
+		return hosts
+	end
+	for host_id, slots in pairs(loaded) do
+		if valid_id(host_id) and type(slots) == "table" then
+			local kept
+			for slot, section in pairs(slots) do
+				if type(slot) == "string" and string.find(slot, "^%a[%w_]*$")
+					and valid_section(section)
+				then
+					kept = kept or {}
+					kept[slot] = section
+				end
+			end
+			hosts[host_id] = kept
+		end
+	end
+	return hosts
 end
 
 local function load_state(mdata)
@@ -81,42 +337,385 @@ local function load_state(mdata)
 			end
 		end
 	end
+	local ids = load_item_ids(mdata and mdata[ITEM_SAVE_KEY])
+	local hosts = load_parked(mdata and mdata[PARKED_SAVE_KEY])
 
 	-- Loading a save without this mod's data must not retain another save's
 	-- marks. Swap only once the payload has been walked, so a bad payload
 	-- cannot leave the live marks half-cleared.
 	necessary_sections = sanitized
+	necessary_ids = ids
+	parked = hosts
+	pending_mags = {}
+	pending_returns = {}
+	disassembling = {}
+end
+
+-- A stale id (missing, or reused by another section) and a part parked on a
+-- host that is gone are dropped once the level has loaded.
+local function drop_stale_item_marks()
+	local sim = alife and alife()
+	if not sim then
+		return
+	end
+	for id, section in pairs(necessary_ids) do
+		local se_obj = sim:object(id)
+		if not (se_obj and se_obj:section_name() == section) then
+			necessary_ids[id] = nil
+		end
+	end
+	for host_id, slots in pairs(parked) do
+		local se_host = sim:object(host_id)
+		if se_host then
+			for slot, section in pairs(slots) do
+				local check = parked_checks[slot]
+				if check then
+					local ok, keep = pcall(check, host_id, section, se_host)
+					if ok and not keep then
+						slots[slot] = nil
+					end
+				end
+			end
+		end
+		if not se_host or next(slots) == nil then
+			parked[host_id] = nil
+		end
+	end
+end
+
+-- Eligibility -----------------------------------------------------------------
+-- An allow-list: anything not matched here is never offered Mark Item.
+
+local KEEPSAKES = {
+	hand_watch = true,
+	picture_woman = true,
+	itm_pda_personal = true,
+	guitar_a = true,
+	guitar_b = true,
+	harmonica_a = true,
+	itm_actor_backpack = true,
+	fieldcooker = true,
+	device_weather_radar = true,
+	ammo_box = true,
+}
+local ARTEFACT_CLASSES = {ARTEFACT = true, SCRPTART = true}
+-- The gun slot each engine addon class fills.
+local ENGINE_SLOTS = {WP_SCOPE = "scope", WP_SILEN = "sil", WP_GLAUN = "gl"}
+
+local function in_list(list, value)
+	if type(list) ~= "table" then
+		return false
+	end
+	for i = 1, #list do
+		if list[i] == value then
+			return true
+		end
+	end
+	return false
+end
+
+-- Whether zz_item_artefact can pack it into a container as <section>_<box>.
+local function is_packable(section)
+	local containers = itms_manager and itms_manager.itms_arty_container
+	if type(containers) ~= "table" then
+		return true
+	end
+	for container in pairs(containers) do
+		if ini_sys:section_exist(section .. "_" .. container) then
+			return true
+		end
+	end
+	return false
+end
+
+local drx_parts
+local function is_drx_part(section)
+	if not drx_parts then
+		drx_parts = {}
+		local collect = utils_data and utils_data.collect_sections
+		local ok, found = pcall(collect, ini_sys, {"addons_table"})
+		if ok and type(found) == "table" then
+			for key in pairs(found) do
+				drx_parts[key] = true
+			end
+		end
+	end
+	return drx_parts[section] == true
+end
+
+-- 3DSS's stand-in for a magnified scope, which turns into the scope itself
+-- as soon as it spawns.
+local function is_3dss_dummy(section)
+	return SYS_GetParam(0, section, "script_binding") == "magnifier_switch.bind_dummy"
+end
+
+local function is_scope_like(section)
+	return is_drx_part(section) or is_3dss_dummy(section)
+end
+
+-- True or false for a weapon attachment, nil for anything else. GAMMA's
+-- scopes are II_FOOD, so this runs before any rule that could admit them.
+-- An attached part's mark waits on its gun, which clones move.
+local function attachment_eligible(section, class)
+	if is_3dss_dummy(section) then
+		return false
+	end
+	-- An engine scope listed among GAMMA's scopes, such as the PU, goes on a
+	-- gun without a scoped variant for it through the engine flag.
+	if is_drx_part(section) then
+		return carry.scopes and carry.weapon_clone and carry.disassembly
+			and (ENGINE_SLOTS[class] == nil or carry.addons)
+	end
+	if ENGINE_SLOTS[class] then
+		return carry.addons and carry.weapon_clone and carry.disassembly
+	end
+end
+
+-- Devices keep their id in use. Lamps (II_ATTCH), glowsticks and the PDAs a
+-- broker takes by section are left out.
+local function is_device(section, class)
+	return IsItem("device", section) and class ~= "II_ATTCH"
+		and not string.find(section, "glowstick", 1, true)
+		and not (item_device and item_device.device_npc_pda
+			and item_device.device_npc_pda[section])
+		and true or false
+end
+
+local function can_mark_item(obj)
+	local parent = obj and obj:parent()
+	if not (parent and parent:id() == AC_ID) then
+		return false
+	end
+	local section = obj:section()
+	if IsItem("quest", section) then
+		return false
+	end
+	local class = SYS_GetParam(0, section, "class")
+	local use_action = SYS_GetParam(0, section, "use1_action_functor")
+
+	-- A gun keeps its mark only through the clone wrapper; knives are never
+	-- cloned. Quick-draw copies are temporary.
+	if IsWeapon(obj) then
+		if string.find(section, "^animation_hit_") then
+			return false
+		end
+		return IsMelee(obj) or carry.weapon_clone
+	end
+	local attachment = attachment_eligible(section, class)
+	if attachment ~= nil then
+		return attachment
+	end
+
+	-- Kinds whose id survives normal use.
+	if class == "WP_BINOC" or IsOutfit(obj) or IsHeadgear(obj) or KEEPSAKES[section] then
+		return true
+	end
+	if is_device(section, class) then
+		return true
+	end
+	if in_list(ui_workshop and ui_workshop.workshop_toolkits, section) then
+		return true
+	end
+	if IsItem("disassemble", section) then
+		return true
+	end
+
+	-- Kinds whose id changes in normal use, offered with their carry hook.
+	if is_magazine(section) then
+		return carry.magazines and magazine_record_ready(obj:id())
+	end
+	if SYS_GetParam(1, section, "is_psu") == true then
+		return carry.psu
+	end
+	if use_action == "mag_pouches.install_pouch" then
+		return carry.pouches
+	end
+	-- A saddle's mark waits on its gun, which clones move.
+	if use_action == "speed_loaders.install_loader" then
+		return carry.saddles and carry.weapon_clone
+	end
+	-- Packed artefacts are mostly SCRPTART, so the container test comes first.
+	if use_action == "itms_manager.use_arty_container" then
+		return carry.containers
+	end
+	if ARTEFACT_CLASSES[class] then
+		return carry.containers or not is_packable(section)
+	end
+	if class == "EQ_BAKPK" then
+		return carry.backpacks
+	end
+	return false
+end
+
+-- Stack split -----------------------------------------------------------------
+-- A marked item never shares a UI cell. When the base proposes a marked
+-- item's cell, the marked cells are hidden and the base is asked again, so
+-- its own stacking rules still decide.
+
+-- ids is the list's section index. The ids in a marked cell leave it, and the
+-- cell loses its section, until restore_cells.
+local function hide_marked_cells(cc, ids)
+	local hidden_ids, hidden_cells = {}, {}
+	for id, idx in pairs(ids) do
+		local ci = cc.cell[idx]
+		if ci and is_item_marked(ci.ID) then
+			ids[id] = nil
+			hidden_ids[id], hidden_cells[ci] = idx, ci.section
+		end
+	end
+	for ci in pairs(hidden_cells) do
+		ci.section = nil
+	end
+	return hidden_ids, hidden_cells
+end
+
+local function restore_cells(ids, hidden_ids, hidden_cells)
+	for id, idx in pairs(hidden_ids) do
+		ids[id] = idx
+	end
+	for ci, section in pairs(hidden_cells) do
+		ci.section = section
+	end
+end
+
+local function install_stack_split()
+	local container = utils_ui and utils_ui.UICellContainer
+	local base = container and container.FindSimilar
+	if type(base) ~= "function" then
+		return false
+	end
+	function container:FindSimilar(obj, sec, ...)
+		if self.showcase or not (obj and obj.id) then
+			return base(self, obj, sec, ...)
+		end
+		if is_item_marked(obj:id()) then
+			return false
+		end
+		local ci = base(self, obj, sec, ...)
+		if not (ci and is_item_marked(ci.ID)) then
+			return ci
+		end
+		local ids = self.indx_sec and self.indx_sec[obj:section()] or {}
+		local hidden_ids, hidden_cells = hide_marked_cells(self, ids)
+		local ok, result = pcall(base, self, obj, sec, ...)
+		restore_cells(ids, hidden_ids, hidden_cells)
+		if not ok then
+			error(result, 0)
+		end
+		if result and is_item_marked(result.ID) then
+			return false
+		end
+		return result
+	end
+	return true
+end
+
+-- Files an item into a list again, so the stack split picks its cell. The
+-- equipment, belt and quick lists never stack.
+local REFILE_BAGS = {"actor_bag", "actor_trade_bag", "actor_trade", "npc_bag", "npc_trade_bag", "npc_trade"}
+
+local function refile_in(cc, obj)
+	local id = obj:id()
+	if not (cc and not cc.manual and not cc.showcase and cc.indx_id and cc.indx_id[id]) then
+		return false
+	end
+	local section = obj:section()
+	cc:RemoveItem(obj, section)
+	cc:AddItem(obj, section)
+	return true
+end
+
+local function refile_item(obj, bag)
+	local gui = ui_inventory and ui_inventory.GUI
+	local lists = gui and gui.CC
+	if not lists then
+		return
+	end
+	local done = bag and refile_in(lists[bag], obj)
+	for i = 1, #REFILE_BAGS do
+		if done then
+			break
+		end
+		if REFILE_BAGS[i] ~= bag then
+			done = refile_in(lists[REFILE_BAGS[i]], obj)
+		end
+	end
+	if gui.Picker_Refresh then
+		gui:Picker_Refresh()
+	end
 end
 
 -- Context menu ----------------------------------------------------------------
 
-local function menu_precondition(_obj, _bag, mode)
-	return mode ~= "repair"
-end
-
-local function menu_name(obj)
-	return is_necessary(obj) and "st_necessary_items_unmark" or "st_necessary_items_mark"
-end
-
-local function menu_action(obj)
-	set_necessary(obj, not is_necessary(obj))
+local function refresh_icons()
 	-- No argument requests only UpdateItems; mode 1 would also re-sort.
 	if rax_icon_layers and rax_icon_layers.refresh then
 		rax_icon_layers.refresh()
 	end
 end
 
+local function menu_precondition(_obj, _bag, mode)
+	return mode ~= "repair"
+end
+
+-- The type entry reads and toggles the section only.
+local function menu_name(obj)
+	return is_type_marked(section_of(obj)) and "st_necessary_items_unmark" or "st_necessary_items_mark"
+end
+
+local function menu_action(obj)
+	local section = section_of(obj)
+	set_necessary(section, not is_type_marked(section))
+	refresh_icons()
+end
+
+local function item_menu_name(obj)
+	return is_item_marked(obj and obj:id()) and "st_necessary_items_unmark_item" or "st_necessary_items_mark_item"
+end
+
+-- Unmark Item shows on any item-marked object wherever it is listed; Mark
+-- Item only on an eligible item the actor holds whose type is not marked.
+local function item_menu_precondition(obj, _bag, mode)
+	if mode == "repair" or not obj then
+		return false
+	end
+	if is_item_marked(obj:id()) then
+		return true
+	end
+	return carry.server and not is_type_marked(obj:section()) and can_mark_item(obj)
+end
+
+local function item_menu_action(obj, bag)
+	if not obj then
+		return
+	end
+	set_item_mark(obj, not is_item_marked(obj:id()))
+	try("re-file", refile_item, obj, bag)
+	refresh_icons()
+end
+
 local function queue_menu_functor()
 	if rax_dynamic_custom_functor and rax_dynamic_custom_functor.add_functor then
 		-- SortingPlus queues Favorite and Junk before this late callback. Using
-		-- the same property system keeps the three entries adjacent.
+		-- the same property system keeps the four entries adjacent.
 		rax_dynamic_custom_functor.add_functor(
 			"necessary_items_toggle",
 			menu_name,
 			menu_precondition,
 			menu_action
 		)
+		rax_dynamic_custom_functor.add_functor(
+			"necessary_items_item_toggle",
+			item_menu_name,
+			item_menu_precondition,
+			item_menu_action
+		)
 	end
+end
+
+local function actor_first_update()
+	try("item-mark check", drop_stale_item_marks)
+	queue_menu_functor()
 end
 
 -- Item-state tab --------------------------------------------------------------
@@ -135,9 +734,9 @@ local function sorting_mark(section)
 	end
 end
 
-local function tab_state(section)
+local function tab_state(section, id)
 	local mark = sorting_mark(section)
-	if is_necessary(section) then
+	if is_type_marked(section) or is_item_marked(id) then
 		return mark and (mark .. "_necessary") or "necessary"
 	end
 	return mark
@@ -183,12 +782,13 @@ local function tab_position(cell, section, item_width)
 	return math.max(0, math.min(x, item_width - TAB_WIDTH / scale)), 0
 end
 
+-- A cell's own object is its head, cell.ID; showcase cells have none.
 local function item_state_tab(cell, _obj, section)
 	if not (cell and cell.container and TAB_BAGS[cell.container.ID]) then
 		return
 	end
 
-	local state = tab_state(section)
+	local state = tab_state(section, cell.showcase == 0 and cell.ID or nil)
 	if not state then
 		return
 	end
@@ -234,18 +834,47 @@ local function is_protected_actor_source(gui, obj, bag)
 	return gui.mode == "trade" and bag == "actor_trade_bag"
 end
 
-local function run_bulk_action(action, gui)
-	bulk_move_depth = bulk_move_depth + 1
-	local ok, result = pcall(action, gui)
-	bulk_move_depth = bulk_move_depth - 1
+local function run_scoped(scope, action, ...)
+	move_depth[scope] = move_depth[scope] + 1
+	local ok, result = pcall(action, ...)
+	move_depth[scope] = move_depth[scope] - 1
 	if not ok then
 		error(result, 0)
 	end
 	return result
 end
 
+-- Drop All drops a stack's children directly, so an item-marked child that
+-- slipped into an actor stack is filed into its own cell first. False while
+-- one is still in the stack.
+local function file_out_marked_children(gui, obj, bag)
+	local cc = gui.CC and gui.CC[bag]
+	local ci = cc and cc:GetCell_ID(id_of(obj))
+	if not (ci and ci.childs) then
+		return true
+	end
+	local marked = {}
+	for child_id in pairs(ci.childs) do
+		if is_item_marked(child_id) then
+			marked[#marked + 1] = child_id
+		end
+	end
+	for i = 1, #marked do
+		local child = level.object_by_id(marked[i])
+		if child then
+			refile_in(cc, child)
+		end
+	end
+	for child_id in pairs(ci.childs or {}) do
+		if is_item_marked(child_id) then
+			return false
+		end
+	end
+	return true
+end
+
 local function actor_menu_before_move(flags, _npc_id, obj, _mode, _bag_id)
-	if bulk_move_depth > 0 and obj and is_necessary(obj) then
+	if move_depth.bulk > 0 and obj and is_necessary(obj) then
 		-- Never restore ret_value: another callback may already have vetoed it.
 		flags.ret_value = false
 	end
@@ -259,31 +888,41 @@ local function guard_inventory_screen()
 	local put_all_base = inventory.LMode_PutAll
 	function inventory:LMode_PutAll()
 		disable_favorite_put_all_protection()
-		return run_bulk_action(put_all_base, self)
+		return run_scoped("bulk", put_all_base, self)
 	end
 
 	-- Automatic routines such as SortingPlus auto-junk may bypass Cond_Move.
 	local action_move_base = inventory.Action_Move
 	function inventory:Action_Move(obj, bag)
-		if bulk_move_depth > 0 and is_protected_actor_source(self, obj, bag) then
+		if (move_depth.bulk > 0 or move_depth.stack > 0)
+			and is_protected_actor_source(self, obj, bag)
+		then
 			return
 		end
 		return action_move_base(self, obj, bag)
 	end
 
-	-- A UI stack contains one section, so one representative safely guards all.
+	-- A UI stack contains one section, so one representative guards the type.
+	-- Its children each go through Action_Move, which keeps an item-marked one
+	-- back from an actor stack while the stack scope is open.
 	local move_all_base = inventory.Action_Move_All
 	function inventory:Action_Move_All(obj, bag)
 		if is_protected_actor_source(self, obj, bag) then
 			return
 		end
-		return move_all_base(self, obj, bag)
+		return run_scoped("stack", move_all_base, self, obj, bag)
 	end
 
 	local drop_all_base = inventory.Action_Drop_All
 	function inventory:Action_Drop_All(obj, bag)
-		if bag == "actor_bag" and is_necessary(obj) then
-			return
+		if bag == "actor_bag" then
+			if is_necessary(obj) then
+				return
+			end
+			local ok, clear = try("Drop All re-file", file_out_marked_children, self, obj, bag)
+			if not (ok and clear) then
+				return
+			end
 		end
 		return drop_all_base(self, obj, bag)
 	end
@@ -294,7 +933,7 @@ local function guard_inventory_screen()
 	local sort_junk_base = inventory.SortJunkTrade
 	if sort_junk_base then
 		function inventory:SortJunkTrade()
-			return run_bulk_action(sort_junk_base, self)
+			return run_scoped("bulk", sort_junk_base, self)
 		end
 	end
 end
@@ -308,7 +947,7 @@ local function guard_companion_give_all()
 		-- Mode 3 is used only by Give All and its carry-weight check.
 		if mode == 3 and source_id == AC_ID then
 			for id, section in pairs(items) do
-				if is_necessary(section) then
+				if is_type_marked(section) or is_item_marked(id) then
 					items[id] = nil
 				end
 			end
@@ -363,25 +1002,881 @@ local function guard_quick_release()
 	end
 end
 
--- The copy of Zatura's auto-stack in Jack Harris's Anti Lag (GAMMA's
--- development branch) merges partly used items with the open stash or body
--- and deletes the emptied ones. Its multi-use test is where it picks items,
--- so marked types answer no there. Zatura's own script has stack_item and
--- stays inside the actor's inventory.
-local function guard_anti_lag_autostack()
-	if not (zatura_autostack and zatura_autostack.autostack_playerinv) or zatura_autostack.stack_item then
+-- Whether an item-marked object of this section could be merged away: one
+-- with uses left to fill, held by the actor or, unless actor_only, anywhere
+-- online.
+local function holds_partial_mark(section, actor_only)
+	for id, marked in pairs(necessary_ids) do
+		if marked == section then
+			local obj = level.object_by_id(id)
+			local parent = obj and obj:parent()
+			if obj and (not actor_only or (parent and parent:id() == AC_ID))
+				and obj:get_remaining_uses() < obj:get_max_uses()
+			then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- Zatura's auto-stack merges partly used items and deletes the emptied ones,
+-- so no section merges while an item-marked object of it could. Its own
+-- stack_item merges per section inside the ruck, where type marks need no
+-- guard; the Anti Lag (dev2) copy also pools with the stash and picks through
+-- its multi-use test, so marked types answer no there too.
+local function guard_autostack()
+	local autostack = zatura_autostack
+	if not (autostack and autostack.autostack_playerinv) then
 		return
 	end
 
-	function zatura_autostack.IsItem(kind, section, ...)
-		if kind == "multiuse" and is_necessary(section) then
+	local stack_item = autostack.stack_item
+	if stack_item then
+		function autostack.stack_item(id, bag, section, ...)
+			if holds_partial_mark(section, true) then
+				return
+			end
+			return stack_item(id, bag, section, ...)
+		end
+		return
+	end
+
+	function autostack.IsItem(kind, section, ...)
+		local result = IsItem(kind, section, ...)
+		if result and kind == "multiuse"
+			and (is_type_marked(section) or holds_partial_mark(section, false))
+		then
 			return false
 		end
-		return IsItem(kind, section, ...)
+		return result
 	end
 end
 
+-- Transactions ----------------------------------------------------------------
+-- While a wrapped call runs, the server object callbacks record every object
+-- it registers and releases. Single-player releases are synchronous, so each
+-- lands inside the call that made it.
+
+local txn
+
+-- A carry hook reads what it needs first, then runs its base in a
+-- transaction. settle(t, c, first) reads the objects this one call created,
+-- t.created[first] onward, so a hook nested in another hook's transaction
+-- still settles its own part. An outermost hook passes straight through
+-- inside a transaction, so one action reached through several hooked layers
+-- settles once. Read and settle failures are logged once under the label;
+-- base errors are re-raised unchanged.
+local function wrap_carry(owner, name, label, read, settle, outermost)
+	local base = owner[name]
+	owner[name] = function(...)
+		if outermost and txn then
+			return base(...)
+		end
+		local ok, c = try(label, read, ...)
+		if not (ok and c) then
+			return base(...)
+		end
+		local own = txn == nil
+		if own then
+			txn = {created = {}, released = {}, clones = {}}
+		end
+		local t = txn
+		local first = #t.created + 1
+		local results = pack(pcall(base, ...))
+		if own then
+			txn = nil
+		end
+		try(label, settle, t, c, first)
+		if not results[1] then
+			error(results[2], 0)
+		end
+		return unpack(results, 2, results.n)
+	end
+end
+
+-- The part a call created for owner: one of the wanted section, or else, for
+-- a GAMMA scope or a 3DSS dummy, the only scope-like one, as a magnified scope
+-- comes back as its dummy and a dummy turns into its scope. Engine parts
+-- match by section only, which skips the grenades a launcher unloads. The
+-- owner is read after the call: during its register callback it is 65535.
+local function created_part(t, first, want, owner)
+	local scope = is_scope_like(want)
+	local single, count = nil, 0
+	for i = first, #t.created do
+		local entry = t.created[i]
+		local se_obj = alife_object(entry.id)
+		if entry.section and se_obj and se_obj.parent_id == owner then
+			if entry.section == want then
+				return entry
+			end
+			if scope and is_scope_like(entry.section) then
+				single, count = entry, count + 1
+			end
+		end
+	end
+	if count == 1 then
+		return single
+	end
+end
+
+-- Marks that part and returns its id.
+local function mark_created(t, first, want, owner)
+	local entry = created_part(t, first, want, owner)
+	if entry then
+		mark_id(entry.id, entry.section)
+		return entry.id
+	end
+end
+
+-- The settle of a call that gives the actor the part of c.section.
+local function settle_given(t, c, first)
+	mark_created(t, first, c.section, AC_ID)
+end
+
+-- Weapon clones ---------------------------------------------------------------
+-- Attaching or detaching a scope, unjamming and magnifier switches replace a
+-- gun with a clone, once per call. The gun's own mark and its parked parts
+-- move to the clone, read before the base releases the old gun.
+
+local function carry_clone(old_id, se_new, mark, slots)
+	local new_id = se_new and se_new.id
+	if type(new_id) ~= "number" or new_id == old_id then
+		return
+	end
+	if txn then
+		txn.clones[old_id] = new_id
+	end
+	if mark then
+		necessary_ids[old_id] = nil
+		necessary_ids[new_id] = se_new:section_name()
+	end
+	if slots then
+		parked[old_id] = nil
+		parked[new_id] = slots
+	end
+end
+
+local function install_clone_carry()
+	local base = _G.alife_clone_weapon
+	if type(base) ~= "function" then
+		return false
+	end
+	function _G.alife_clone_weapon(se_obj, ...)
+		local old_id = se_obj and se_obj.id
+		if type(old_id) ~= "number" then
+			return base(se_obj, ...)
+		end
+		local mark, slots = necessary_ids[old_id], parked[old_id]
+		local results = pack(base(se_obj, ...))
+		if mark or slots or txn then
+			try("weapon clone carry", carry_clone, old_id, results[1], mark, slots)
+		end
+		return unpack(results, 1, results.n)
+	end
+	return true
+end
+
+-- Magazines -------------------------------------------------------------------
+-- Mags copies a magazine's whole record, mark included, on load, eject, clone
+-- and disassembly. Retool replaces the magazine; the new one gets the mark once
+-- Mags has made its record, which NI never makes itself.
+
+-- A time event: true ends it, false polls again on the next update.
+local function poll_pending_mag(id, deadline)
+	if not pending_mags[id] then
+		return true
+	end
+	local ok, ready = try("magazine retool carry", magazine_record_ready, id)
+	if ok and not ready and time_global() <= deadline then
+		return false
+	end
+	pending_mags[id] = nil
+	if ok and ready then
+		set_magazine_mark(id, true)
+	end
+	return true
+end
+
+local function carry_magazine_mark(id)
+	if magazine_record_ready(id) then
+		set_magazine_mark(id, true)
+		return
+	end
+	pending_mags[id] = true
+	CreateTimeEvent("necessary_items", "magazine_mark_" .. id, 0, poll_pending_mag,
+		id, time_global() + PENDING_MAG_MS)
+end
+
+-- A refused retool creates nothing, and the old magazine keeps its mark.
+local function settle_retool(t, _, first)
+	for i = first, #t.created do
+		local entry = t.created[i]
+		if is_magazine(entry.section) then
+			carry_magazine_mark(entry.id)
+			return
+		end
+	end
+end
+
+-- The eject timer writes the ejected magazine's record, mark included, a tick
+-- after its cell may have joined a stack. A marked one then gets its own cell.
+local function file_out_ejected_mag(id)
+	local gui = ui_inventory and ui_inventory.GUI
+	local lists = gui and gui.CC
+	if not (lists and gui.IsShown and gui:IsShown() and is_item_marked(id)) then
+		return
+	end
+	for i = 1, #REFILE_BAGS do
+		local bag = REFILE_BAGS[i]
+		local cc = lists[bag]
+		local ci = cc and cc.indx_id and cc.indx_id[id] and cc:GetCell_ID(id)
+		if ci then
+			local shared = ci.ID ~= id or (ci.childs and next(ci.childs))
+			local obj = shared and level.object_by_id(id)
+			if obj then
+				refile_item(obj, bag)
+				refresh_icons()
+			end
+			return
+		end
+	end
+end
+
+local function install_magazine_carry()
+	local mags, binder = magazines, magazine_binder
+	local retool = mags and mags.retool_mag_functor
+	if not (type(retool) == "function" and binder
+		and type(binder.get_mag_property) == "function"
+		and type(binder.get_data) == "function"
+		and type(binder.set_data) == "function"
+		and type(binder.is_magazine) == "function")
+	then
+		return false
+	end
+	wrap_carry(mags, "retool_mag_functor", "magazine retool carry", function(obj)
+		return obj and is_item_marked(obj:id()) and is_magazine(obj:section())
+	end, settle_retool)
+
+	local eject_timer = mags.timer_eject_magazine
+	if type(eject_timer) == "function" then
+		-- Its result must pass through: true ends the time event.
+		function mags.timer_eject_magazine(weapon_id, id, ...)
+			local results = pack(eject_timer(weapon_id, id, ...))
+			try("ejected magazine re-file", file_out_ejected_mag, id)
+			return unpack(results, 1, results.n)
+		end
+	end
+	return true
+end
+
+-- Parts on hosts --------------------------------------------------------------
+-- Installing an exo PSU, a mag pouch or a side saddle releases the item and
+-- keeps a record on the host; removing it creates a new item. A marked part's
+-- mark waits on the host meanwhile, in the slot named after the part, and is
+-- used only while the owner's record still holds that part. held(host_id)
+-- reads that record afresh, as the owners replace their tables on load.
+
+-- Wraps one owner's install and remove; store names the owner's record.
+-- pick(...) names an install call's part and host as the owner's install
+-- picks them, read before the base releases the part.
+local function install_host_part(owner, slot, install_name, remove_name, store, held, pick)
+	if not (owner and type(owner[install_name]) == "function"
+		and type(owner[remove_name]) == "function" and owner[store] ~= nil)
+	then
+		return false
+	end
+	local label = slot .. " carry"
+	-- Every remove function takes the host. A removal marks only a part of the
+	-- parked section, and a park the owner's record no longer matches is dropped.
+	wrap_carry(owner, remove_name, label, function(host)
+		local host_id = host and host:id()
+		local section = host_id and parked_slot(host_id, slot)
+		return section and {host_id = host_id, section = section}
+	end, function(t, c, first)
+		mark_created(t, first, c.section, AC_ID)
+		if held(c.host_id) ~= c.section then
+			park(c.host_id, slot, nil)
+		end
+	end)
+	-- The install took when the owner's record holds the part. Each owner
+	-- removes the old part first, and an unmarked part clears an older park.
+	wrap_carry(owner, install_name, label, function(...)
+		local part, host = pick(...)
+		if part and host then
+			return {host_id = host:id(), section = part:section(), marked = is_item_marked(part:id())}
+		end
+	end, function(_, c)
+		if held(c.host_id) == c.section then
+			park(c.host_id, slot, c.marked and c.section or nil)
+		end
+	end)
+	parked_checks[slot] = function(host_id, section)
+		return held(host_id) == section
+	end
+	return true
+end
+
+local function psu_held(host_id)
+	local data = item_exo_device.get_data(host_id)
+	return data and data.supply and data.supply.name
+end
+
+local function install_psu_carry()
+	return install_host_part(item_exo_device, "psu", "install_psu", "remove_psu", "get_data", psu_held,
+		function(suit, _, psu)
+			return psu, suit
+		end)
+end
+
+local function pouch_held(host_id)
+	local record = mag_pouches.pouches[host_id]
+	return record and record.section
+end
+
+local function install_pouch_carry()
+	return install_host_part(mag_pouches, "pouch", "install_pouch", "remove_pouch", "pouches", pouch_held,
+		function(pouch, outfit)
+			return pouch, outfit or (db.actor and db.actor:item_in_slot(7))
+		end)
+end
+
+local function saddle_held(host_id)
+	local record = speed_loaders.speed_loaders[host_id]
+	return record and record.section
+end
+
+local function install_saddle_carry()
+	return install_host_part(speed_loaders, "saddle", "install_loader", "remove_loader", "speed_loaders",
+		saddle_held, function(loader, weapon)
+			return loader, weapon or (item_weapon and item_weapon.get_weapon_slot and item_weapon.get_weapon_slot())
+		end)
+end
+
+-- Backpacks -------------------------------------------------------------------
+-- Deploying a backpack releases it and leaves a stash box; the box's entry in
+-- player_created_stashes names the backpack section to give back. A marked
+-- backpack's mark waits on the box until that backpack comes back.
+
+local function stash_records()
+	local m_data = alife_storage_manager.get_state()
+	return m_data and m_data.player_created_stashes
+end
+
+-- Read before the base releases the box, which drops its park.
+local function stash_pickup_context(box_id)
+	local section = box_id and parked_slot(box_id, "backpack")
+	local records = section and stash_records()
+	if records and records[box_id] == section then
+		return {section = section}
+	end
+end
+
+-- Quick Release and Create stash, through actor_stash_patch. The backpack is
+-- released after this callback, and the stash list may be written after it.
+local function park_on_stash(backpack, se_stash)
+	if backpack and se_stash and se_stash.id and is_item_marked(backpack:id()) then
+		park(se_stash.id, "backpack", backpack:section())
+	end
+end
+
+local function on_before_stash_create(backpack, se_stash)
+	try("backpack deploy carry", park_on_stash, backpack, se_stash)
+end
+
+-- Dot Marks deploys a backpack lying in the world, without the callback.
+local function dotmarks_deploy_context(id)
+	local backpack = id and level.object_by_id(id)
+	if backpack and is_item_marked(id) then
+		return {section = backpack:section()}
+	end
+end
+
+local function settle_deploy(t, c, first)
+	local records = stash_records()
+	for i = first, #t.created do
+		local entry = t.created[i]
+		if entry.section == "inv_backpack" and records and records[entry.id] == c.section then
+			park(entry.id, "backpack", c.section)
+			return
+		end
+	end
+end
+
+local function holds_backpack(host_id, section, se_host)
+	local records = stash_records()
+	return se_host:section_name() == "inv_backpack" and records ~= nil and records[host_id] == section
+end
+
+-- item_backpack's take handler gives the backpack back when its box empties,
+-- also for Dot Marks' take-all.
+local function install_backpack_pickup_carry()
+	local owner = item_backpack
+	if not (owner and type(owner.actor_on_item_take_from_box) == "function") then
+		return false
+	end
+	wrap_carry(owner, "actor_on_item_take_from_box", "backpack pick-up carry", function(box)
+		if box and box:section() == "inv_backpack" then
+			return stash_pickup_context(box:id())
+		end
+	end, settle_given)
+	return true
+end
+
+-- Only with actor_stash_patch, whose callback is the one deploy seam of the
+-- backpack's own menu entries. With Dot Marks, its deploy and pick-up too.
+local function install_backpack_carry()
+	if not (carry.backpack_pickup and actor_stash_patch and alife_storage_manager) then
+		return false
+	end
+	local dotmarks = ui_hud_dotmarks
+	if dotmarks and not (type(dotmarks.deploy_backpack) == "function"
+		and type(dotmarks.remove_placed_backpack) == "function")
+	then
+		return false
+	end
+	RegisterScriptCallback("actor_on_before_stash_create", on_before_stash_create)
+	if dotmarks then
+		wrap_carry(dotmarks, "deploy_backpack", "backpack deploy carry",
+			dotmarks_deploy_context, settle_deploy)
+		wrap_carry(dotmarks, "remove_placed_backpack", "backpack pick-up carry",
+			stash_pickup_context, settle_given)
+	end
+	parked_checks.backpack = holds_backpack
+	return true
+end
+
+-- Weapon attachments ----------------------------------------------------------
+-- Attaching a part releases it; detaching one creates a new item. A marked
+-- part's mark waits on the gun meanwhile, in the slot it fills ("scope",
+-- "sil" or "gl"). A GAMMA scope swaps the gun for a clone, which takes the
+-- gun's parks along; an engine addon only switches the gun's addon flag.
+
+local function expect_return(section, ms)
+	pending_returns[#pending_returns + 1] = {section = section, deadline = time_global() + ms}
+end
+
+-- The first object of an expected section the actor takes in time gets the
+-- mark; expired expectations are dropped.
+local function take_returned_part(obj)
+	local now, id, section = time_global(), obj:id(), obj:section()
+	local taken = necessary_ids[id] ~= nil
+	local kept = {}
+	for i = 1, #pending_returns do
+		local entry = pending_returns[i]
+		if now <= entry.deadline then
+			if not taken and entry.section == section then
+				taken = mark_id(id, section)
+			else
+				kept[#kept + 1] = entry
+			end
+		end
+	end
+	pending_returns = kept
+end
+
+local function on_item_take(obj)
+	if pending_returns[1] and obj and not try("returned part carry", take_returned_part, obj) then
+		pending_returns = {}
+	end
+end
+
+-- Whether the gun's engine slot holds its addon; nil without the gun.
+local function engine_attached(host_id, slot)
+	local gun = level.object_by_id(host_id)
+	if not gun then
+		return nil
+	end
+	if slot == "sil" then
+		return gun:weapon_silencer_status() == 2 and gun:weapon_is_silencer()
+	elseif slot == "gl" then
+		return gun:weapon_grenadelauncher_status() == 2 and gun:weapon_is_grenadelauncher()
+	end
+	return gun:weapon_scope_status() == 2 and gun:weapon_is_scope()
+end
+
+-- Read before the base releases the part. The gun's park counts too: a swap
+-- hands back the scope it held, and an unmarked part clears its slot.
+local function attach_context(part, gun)
+	if not (part and gun) then
+		return nil
+	end
+	local part_id, host_id = part:id(), gun:id()
+	local marked = necessary_ids[part_id] ~= nil
+	local held = parked[host_id]
+	if not (marked or held) then
+		return nil
+	end
+	local section = part:section()
+	local slot = ENGINE_SLOTS[SYS_GetParam(0, section, "class")]
+	local se_host = alife_object(host_id)
+	return {
+		part_id = part_id,
+		section = section,
+		marked = marked,
+		host_id = host_id,
+		owner = se_host and se_host.parent_id,
+		held_scope = held and held.scope,
+		slot = slot,
+		was = slot and engine_attached(host_id, slot),
+	}
+end
+
+-- A GAMMA scope went on when the gun was cloned and the part released; an
+-- engine addon when the gun's flag came on. Anything else changed nothing.
+local function settle_attach(t, c, first)
+	local host_id = t.clones[c.host_id] or c.host_id
+	local slot
+	if host_id ~= c.host_id then
+		slot = t.released[c.part_id] and "scope"
+	elseif c.slot and c.was == false and engine_attached(host_id, c.slot) == true then
+		slot = c.slot
+	end
+	if not slot then
+		return
+	end
+	if slot == "scope" and c.held_scope then
+		mark_created(t, first, c.held_scope, c.owner)
+	end
+	park(host_id, slot, c.marked and c.section or nil)
+end
+
+local function detach_context(gun, slot)
+	local host_id = gun and gun:id()
+	local want = host_id and parked_slot(host_id, slot)
+	if not want then
+		return nil
+	end
+	local se_host = alife_object(host_id)
+	return {
+		host_id = host_id,
+		slot = slot,
+		want = want,
+		owner = se_host and se_host.parent_id,
+		was = engine_attached(host_id, slot),
+	}
+end
+
+-- A GAMMA scope came off when the gun was cloned; an engine addon when its
+-- flag went off. An engine part not created inside the call is expected
+-- through actor_on_item_take instead.
+local function settle_detach(t, c, first)
+	local host_id = t.clones[c.host_id] or c.host_id
+	if host_id == c.host_id then
+		if not (c.was == true and engine_attached(host_id, c.slot) == false) then
+			return
+		end
+	elseif c.slot ~= "scope" then
+		return
+	end
+	if not mark_created(t, first, c.want, c.owner) and host_id == c.host_id then
+		expect_return(c.want, DEFERRED_MS)
+	end
+	park(host_id, c.slot, nil)
+end
+
+-- The silencer key works on the lowered gun through the engine directly, and
+-- names the gun only in its own locals, so every slotted gun that takes a
+-- silencer is read; the part it would attach is picked the way it picks it.
+local function toggle_context()
+	local actor = db.actor
+	local hosts = {}
+	for i = 1, 3 do
+		local gun = actor and actor:item_in_slot(i)
+		if gun and IsWeapon(gun) and gun:weapon_silencer_status() == 2 then
+			local host_id = gun:id()
+			local section = utils_item.get_param(gun:section(), host_id, "silencer_name", "string")
+			local part = section and actor:object(section)
+			local marked = part and necessary_ids[part:id()] ~= nil
+			local want = parked_slot(host_id, "sil")
+			if marked or want then
+				hosts[#hosts + 1] = {
+					host_id = host_id,
+					slot = "sil",
+					section = section,
+					marked = marked,
+					want = want,
+					owner = AC_ID,
+					was = engine_attached(host_id, "sil"),
+				}
+			end
+		end
+	end
+	return hosts[1] and hosts or nil
+end
+
+-- settle_attach acts only on a silencer that went on, settle_detach only on
+-- one that came off.
+local function settle_toggle(t, c, first)
+	for i = 1, #c do
+		settle_attach(t, c[i], first)
+		if c[i].want then
+			settle_detach(t, c[i], first)
+		end
+	end
+end
+
+-- A marked 3DSS dummy hands its mark to the scope it turns into, which
+-- bind_dummy gives the actor.
+local function dummy_context(dummy)
+	local id = dummy and dummy:id()
+	if id and necessary_ids[id] then
+		return {section = dummy:section()}
+	end
+end
+
+-- A check for drop_stale_item_marks: a GAMMA scope stays parked only on a
+-- scoped gun. A gun with no scoped variant for that scope, such as an SKS
+-- with a PU, took it through its engine flag, which cannot be read offline.
+local function holds_scope(_host_id, section, se_host)
+	if not is_drx_part(section) then
+		return true
+	end
+	local host_section = se_host:section_name()
+	local parent_section = ini_sys:r_string_ex(host_section, "parent_section")
+	if not ini_sys:section_exist((parent_section or host_section) .. "_" .. section) then
+		return true
+	end
+	return parent_section ~= nil and parent_section ~= host_section
+end
+
+-- item_weapon's own attach and detach, which Toggle Scope, Mags and the side
+-- saddles wrap in their on_game_start, so these must be wrapped in this one.
+-- The Quick Action Wheel's own copies and 3DSS's dummy scopes would drop a
+-- mark, so when either mod is present but cannot be wrapped, GAMMA scopes are
+-- not offered Mark Item; marks already placed still carry.
+local function install_scope_carry()
+	local owner = item_weapon
+	if not (owner and type(owner.attach_scope) == "function"
+		and type(owner.detach_scope) == "function")
+	then
+		return false
+	end
+	wrap_carry(owner, "attach_scope", "scope carry", attach_context, settle_attach, true)
+	wrap_carry(owner, "detach_scope", "scope carry", function(gun)
+		return detach_context(gun, "scope")
+	end, settle_detach, true)
+	parked_checks.scope = holds_scope
+
+	local wheel = haru_quick_action_wheel_mcm and haru_quick_action_wheel_mcm.QScopeWheelOption
+	if wheel then
+		if not (type(wheel.Attach) == "function" and type(wheel.Detach) == "function") then
+			error("Quick Action Wheel scope option has no Attach and Detach", 0)
+		end
+		wrap_carry(wheel, "Attach", "wheel scope carry", function(_, part, gun)
+			return attach_context(part, gun)
+		end, settle_attach, true)
+		wrap_carry(wheel, "Detach", "wheel scope carry", function(_, gun)
+			return detach_context(gun, "scope")
+		end, settle_detach, true)
+	end
+	local switch = magnifier_switch
+	if switch then
+		if type(switch.bind_dummy) ~= "function" then
+			error("3DSS magnifier_switch has no bind_dummy", 0)
+		end
+		wrap_carry(switch, "bind_dummy", "3DSS dummy carry", dummy_context, settle_given, true)
+	end
+	return true
+end
+
+-- utils_item's attach and detach, used by the inventory menu, drag and drop,
+-- the Quick Action Wheel and Toggle Scope; also the silencer key, without
+-- which engine addons are not offered Mark Item.
+local function install_addon_carry()
+	local owner = utils_item
+	if not (owner and type(owner.attach_addon) == "function"
+		and type(owner.detach_addon) == "function")
+	then
+		return false
+	end
+	wrap_carry(owner, "attach_addon", "addon carry", function(gun, part)
+		return attach_context(part, gun)
+	end, settle_attach, true)
+	wrap_carry(owner, "detach_addon", "addon carry", function(gun, _, slot)
+		return detach_context(gun, slot)
+	end, settle_detach, true)
+
+	local guns = item_weapon
+	local toggle = guns and guns.toggle_silencer
+	if toggle ~= nil then
+		if type(toggle) ~= "function" then
+			error("item_weapon.toggle_silencer is not a function", 0)
+		end
+		wrap_carry(guns, "toggle_silencer", "silencer toggle carry", toggle_context, settle_toggle, true)
+	end
+	return true
+end
+
+-- Weapon disassembly ----------------------------------------------------------
+-- A disassembled gun is released at once or, with GAMMA Mags Reloaded, a
+-- moment after disassembly_weapon returns; its attached parts come back a
+-- timer after that. So the call only notes the gun, and its release expects
+-- the marked parts it held through actor_on_item_take.
+
+local function note_disassembly(gun)
+	local parent = gun and gun:parent()
+	local id = gun and gun:id()
+	if parent and parent:id() == AC_ID and parked[id] then
+		disassembling[id] = time_global() + DEFERRED_MS
+	end
+end
+
+-- The attachment slots only: a side saddle comes back through its own carry.
+local function expect_disassembled_parts(id)
+	local release_by = disassembling[id]
+	disassembling[id] = nil
+	if time_global() > release_by then
+		return
+	end
+	for _, slot in pairs(ENGINE_SLOTS) do
+		local section = parked_slot(id, slot)
+		if section then
+			expect_return(section, DISASSEMBLY_MS)
+		end
+	end
+end
+
+local function install_disassembly_carry()
+	local owner = item_parts
+	local base = owner and owner.disassembly_weapon
+	if type(base) ~= "function" then
+		return false
+	end
+	function owner.disassembly_weapon(gun, ...)
+		try("disassembly carry", note_disassembly, gun)
+		return base(gun, ...)
+	end
+	return true
+end
+
+-- Artefact containers ---------------------------------------------------------
+-- Packing releases the artefact and the box and creates <artefact>_<box>;
+-- opening it does the reverse. The packed item is marked when either was,
+-- and its "arty" and "box" slots keep which ones, so each gets its mark back.
+
+-- Packed sections end in a container's name, as zz_item_artefact parses them.
+local function split_packed(section)
+	for container in pairs(itms_manager.itms_arty_container) do
+		local suffix = "_" .. container
+		if #section > #suffix and string.sub(section, -#suffix) == suffix then
+			return string.sub(section, 1, -#suffix - 1), container
+		end
+	end
+end
+
+local function pack_context(artefact, box, arty_section, box_section)
+	local arty = artefact and necessary_ids[artefact:id()] ~= nil
+	local marked_box = box and necessary_ids[box:id()] ~= nil
+	if not (arty or marked_box) then
+		return nil
+	end
+	return {
+		section = arty_section .. "_" .. box_section,
+		arty = arty and arty_section or nil,
+		box = marked_box and box_section or nil,
+	}
+end
+
+local function settle_pack(t, c, first)
+	local id = mark_created(t, first, c.section, AC_ID)
+	if id then
+		park(id, "arty", c.arty)
+		park(id, "box", c.box)
+	end
+end
+
+-- A packed item marked by hand has neither slot and gives the artefact its
+-- mark.
+local function unpack_context(packed)
+	local id = packed and packed:id()
+	if not (id and necessary_ids[id]) then
+		return nil
+	end
+	local arty_section, box_section = split_packed(packed:section())
+	if not arty_section then
+		return nil
+	end
+	local arty, box = parked_slot(id, "arty"), parked_slot(id, "box")
+	return {
+		arty_section = arty_section,
+		box_section = box_section,
+		arty = arty ~= nil or box == nil,
+		box = box ~= nil,
+	}
+end
+
+local function settle_unpack(t, c, first)
+	if c.box then
+		mark_created(t, first, c.box_section, AC_ID)
+	end
+	if c.arty then
+		mark_created(t, first, c.arty_section, AC_ID)
+	end
+end
+
+-- A packed item's slots last only while it stays marked.
+local function still_marked(host_id)
+	return necessary_ids[host_id] ~= nil
+end
+
+-- zz_item_artefact replaces both functions when it loads, and every caller
+-- looks them up by name, so on_game_start wraps the live ones.
+local function install_container_carry()
+	local owner = itms_manager
+	if not (owner and type(owner.dropdrop_ArtyContainer) == "function"
+		and type(owner.use_arty_container) == "function"
+		and type(owner.itms_arty_container) == "table")
+	then
+		return false
+	end
+	wrap_carry(owner, "dropdrop_ArtyContainer", "artefact pack carry", pack_context, settle_pack, true)
+	wrap_carry(owner, "use_arty_container", "artefact unpack carry", unpack_context, settle_unpack, true)
+	parked_checks.arty = still_marked
+	parked_checks.box = still_marked
+	return true
+end
+
 -- Lifecycle -------------------------------------------------------------------
+
+-- Both server object callbacks feed an open transaction. A release also ends
+-- the id's marks, so the next object that reuses the id carries none. Handlers
+-- here run unprotected, so anything beyond plain table work runs in pcall.
+local function on_object_register(se_obj)
+	if txn and se_obj then
+		local ok, section = pcall(se_obj.section_name, se_obj)
+		txn.created[#txn.created + 1] = {id = se_obj.id, section = ok and section or nil}
+	end
+end
+
+local function on_object_unregister(se_obj)
+	local id = se_obj and se_obj.id
+	if id == nil then
+		return
+	end
+	if txn then
+		txn.released[id] = true
+	end
+	if disassembling[id] then
+		try("release carry", expect_disassembled_parts, id)
+	end
+	try("release carry", clear_stale_magazine_mark, id)
+	necessary_ids[id] = nil
+	parked[id] = nil
+	pending_mags[id] = nil
+end
+
+local function install_server_callbacks()
+	if type(_G.CSE_ALifeDynamicObject_on_unregister) == "function" then
+		RegisterScriptCallback("server_object_on_unregister", on_object_unregister)
+		if type(_G.CSE_ALifeDynamicObject_on_register) == "function" then
+			RegisterScriptCallback("server_object_on_register", on_object_register)
+			return true
+		end
+	end
+	printf("[Necessary Items] server object callbacks unavailable: Mark Item is not offered")
+	return false
+end
 
 function on_game_start()
 	if initialized then
@@ -389,21 +1884,49 @@ function on_game_start()
 	end
 	initialized = true
 
-	-- Persistence, the bulk-move veto and the menu entry come first, so a
+	-- Persistence, the bulk-move veto and the menu entries come first, so a
 	-- failure in a later integration can never cost the player their marks.
 	RegisterScriptCallback("ActorMenu_on_item_before_move", actor_menu_before_move)
 	RegisterScriptCallback("save_state", save_state)
 	RegisterScriptCallback("load_state", load_state)
-	RegisterScriptCallback("actor_on_first_update", queue_menu_functor)
+	RegisterScriptCallback("actor_on_first_update", actor_first_update)
 	RegisterScriptCallback("on_option_change", queue_menu_functor)
+	RegisterScriptCallback("actor_on_item_take", on_item_take)
+	carry.server = install_server_callbacks()
 
-	guard_inventory_screen()
-	guard_companion_give_all()
-	guard_fast_transfer()
-	guard_unusable_parts()
-	guard_quick_release()
-	guard_anti_lag_autostack()
-	register_item_tab()
+	carry.weapon_clone = install("weapon clone carry", install_clone_carry)
+	install("stack split", install_stack_split)
 
-	printf("[Necessary Items] installed | build=%s | section marks and bulk guards active", BUILD)
+	install("inventory screen guards", guard_inventory_screen)
+	install("companion Give All guard", guard_companion_give_all)
+	install("Fast Transfer guard", guard_fast_transfer)
+	install("Unusable Parts guard", guard_unusable_parts)
+	install("Quick Release guard", guard_quick_release)
+	install("auto-stack guard", guard_autostack)
+
+	carry.magazines = install("magazine carry", install_magazine_carry)
+	carry.psu = install("exo PSU carry", install_psu_carry)
+	carry.backpacks = install("backpack carry", install_backpack_carry)
+	carry.scopes = install("scope carry", install_scope_carry)
+	carry.addons = install("engine addon carry", install_addon_carry)
+	carry.disassembly = install("weapon disassembly carry", install_disassembly_carry)
+	carry.containers = install("artefact container carry", install_container_carry)
+	install("item tabs", register_item_tab)
+
+	printf("[Necessary Items] installed | build=%s | section and item marks and bulk guards active", BUILD)
+end
+
+-- File-scope carry wraps ------------------------------------------------------
+-- mag_pouches and speed_loaders hand remove_pouch and remove_loader to
+-- custom_functor_autoinject, and item_backpack registers its take handler, as
+-- values in their own on_game_start, which runs before this file's. These are
+-- therefore wrapped while the namespaces load. The sentinel keeps a second run
+-- of this file from wrapping them again; rawget keeps the engine from looking
+-- for a script of that name.
+
+if not rawget(_G, "necessary_items_file_scope_wraps") then
+	rawset(_G, "necessary_items_file_scope_wraps", true)
+	carry.pouches = install("mag pouch carry", install_pouch_carry)
+	carry.saddles = install("side saddle carry", install_saddle_carry)
+	carry.backpack_pickup = install("backpack pick-up carry", install_backpack_pickup_carry)
 end
