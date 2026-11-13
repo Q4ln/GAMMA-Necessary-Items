@@ -2,7 +2,7 @@
 -- Section and item marks that protect items from bulk and automatic outgoing
 -- actions. A necessary mark never participates in inventory sorting.
 
-local BUILD = "d2026.11.12.1"
+local BUILD = "d2026.11.13.1"
 local SAVE_KEY = "gamma_necessary_item_sections"
 -- Item marks: necessary_ids[id] = section. Parked marks belong to parts held
 -- by a host (a gun, a suit, a stash box, a packed artefact):

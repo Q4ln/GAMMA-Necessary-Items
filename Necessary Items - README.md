@@ -1,6 +1,6 @@
 # Necessary Items
 
-Version `d2026.11.12.1`
+Version `d2026.11.13.1`
 
 Necessary Items adds a **Mark Necessary** entry to the inventory context menu,
 next to SortingPlus's Favorite and Junk. Every item of a marked type then stays
@@ -156,7 +156,7 @@ MO2 priority does not matter. Restart the game after installing or updating.
 
 When it loads, the game log (`xray_<user>.log` in Anomaly's `appdata\logs`
 folder) contains one line naming the build:
-`[Necessary Items] installed | build=d2026.11.12.1 | section and item marks and bulk guards active`.
+`[Necessary Items] installed | build=d2026.11.13.1 | section and item marks and bulk guards active`.
 
 ## Compatibility and conflicts
 
@@ -287,6 +287,11 @@ settings, and the leftover marks in your saves and magazine records are ignored.
   Favorite types; mark those types Necessary instead.
 
 ## Changelog
+
+### d2026.11.13.1
+
+- Fixed the Russian menu entries, which showed garbled text in game. The
+  Russian string file is now plain windows-1251 text, like GAMMA's own.
 
 ### d2026.11.12.1
 
